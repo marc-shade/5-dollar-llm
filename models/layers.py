@@ -21,14 +21,30 @@ class Rotary(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     def __init__(
-        self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1
+        self, 
+        d_model: int, 
+        n_heads: int, 
+        max_seq_len: int, 
+        dropout: float = 0.1,
+        num_key_value_heads: Optional[int] = None
     ):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
+        self.num_key_value_heads = num_key_value_heads if num_key_value_heads is not None else n_heads
         self.d_k = d_model // n_heads
+        
+        # Verify GQA compatibility
+        if n_heads % self.num_key_value_heads != 0:
+            raise ValueError(f"n_heads ({n_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})")
+            
+        self.num_key_value_groups = n_heads // self.num_key_value_heads
 
-        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        # Projections
+        self.q_proj = nn.Linear(d_model, n_heads * self.d_k, bias=False)
+        self.k_proj = nn.Linear(d_model, self.num_key_value_heads * self.d_k, bias=False)
+        self.v_proj = nn.Linear(d_model, self.num_key_value_heads * self.d_k, bias=False)
+        
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.q_norm = nn.RMSNorm(self.d_k)
         self.k_norm = nn.RMSNorm(self.d_k)
@@ -37,27 +53,52 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len = x.size(0), x.size(1)
-        # B, T = x.size(0), x.size(1)
-        # qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.d_k).permute(2, 0, 3, 1, 4)
-        # Q, K, V = qkv[0], qkv[1], qkv[2]  # [B, H, T, D]
 
-        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        Q, K, V = qkv[0], qkv[1], qkv[2]  # [B, H, T, D]
+        # Basic projection
+        # Q: [B, T, H_q * D]
+        # K, V: [B, T, H_kv * D]
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        # Q = self.rotary(Q)
-        # K = self.rotary(K)
-        # Apply RoPE on [B, T, H, D]
-        Q = self.rotary(self.q_norm(Q.transpose(1, 2))).transpose(1, 2)
-        K = self.rotary(self.k_norm(K.transpose(1, 2))).transpose(1, 2)
+        # Reshape to [B, T, H, D]
+        q = q.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2) # [B, H, T, D]
+        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.d_k).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.d_k).transpose(1, 2)
 
+        # Norms (applied on head dim) and RoPE
+        # RoPE expects [B, T, H, D] but our implementation does transpose inside Rotary if needed?
+        # Checking Rotary implementation: it calls torchtune Rope.
+        # Rotary.forward takes x_BTHD. But in previous code it was doing permutations.
+        # Previous code: 
+        #   Q = self.rotary(self.q_norm(Q.transpose(1, 2))).transpose(1, 2)
+        #   Here Q is [B, H, T, D].
+        #   Q.transpose(1, 2) is [B, T, H, D].
+        #   Rotary takes [B, T, H, D].
+        #   So let's stick to that pattern.
+        
+        q = self.q_norm(q.transpose(1, 2)) # [B, T, H, D]
+        k = self.k_norm(k.transpose(1, 2)) # [B, T, H_kv, D]
+        
+        q = self.rotary(q).transpose(1, 2) # Back to [B, H, T, D]
+        k = self.rotary(k).transpose(1, 2) # Back to [B, H_kv, T, D]
+        # V no RoPE
+        
+        # Handle GQA repetition
+        if self.num_key_value_groups > 1:
+            k = torch.repeat_interleave(k, dim=1, repeats=self.num_key_value_groups)
+            v = torch.repeat_interleave(v, dim=1, repeats=self.num_key_value_groups)
+
+        # Attention
         attn_output = F.scaled_dot_product_attention(
-            Q, K, V, is_causal=True, dropout_p=self.dropout if self.training else 0.0
+            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0
         )
-        attn_output = attn_output.transpose(1, 2).reshape(
+        
+        # Reshape back to [B, T, H * D]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, seq_len, self.d_model
         )
-        # attn_output = attn_output.transpose(1, 2).reshape(B, T, self.d_model)
+        
         return self.w_o(attn_output)
 
 
@@ -141,6 +182,7 @@ class MoETransformerBlock(nn.Module):
         num_experts: int = 8,
         top_k: int = 2,
         dropout: float = 0.1,
+        num_key_value_heads: Optional[int] = None,
     ):
         super().__init__()
 
@@ -157,7 +199,13 @@ class MoETransformerBlock(nn.Module):
                 dropout,
             )
         else:
-            self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
+            self.attention = MultiHeadAttention(
+                d_model, 
+                n_heads, 
+                max_seq_len, 
+                dropout,
+                num_key_value_heads=num_key_value_heads
+            )
 
         # MoE layer
         self.feed_forward = MixtureOfExperts(d_model, d_ff, num_experts, top_k, dropout)
@@ -176,3 +224,4 @@ class MoETransformerBlock(nn.Module):
         ff_out, aux_loss = self.feed_forward(self.norm2(x))
         x = x + self.dropout(ff_out)
         return x, aux_loss
+

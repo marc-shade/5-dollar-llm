@@ -20,7 +20,7 @@ class MoEMinimalLLM(nn.Module):
         # Transformer blocks with MoE
         self.transformer_blocks = nn.ModuleList(
             [
-                MoETransformerBlock(
+            MoETransformerBlock(
                     config.d_model,
                     config.n_heads,
                     config.d_ff,
@@ -33,6 +33,7 @@ class MoEMinimalLLM(nn.Module):
                     config.num_experts,
                     config.expert_top_k,
                     config.dropout,
+                    num_key_value_heads=getattr(config, "num_key_value_heads", None),
                 )
                 for i in range(config.n_layers)
             ]
